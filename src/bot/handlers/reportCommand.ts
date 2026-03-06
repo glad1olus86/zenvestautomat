@@ -25,11 +25,14 @@ export function setupReportCommand(bot: Bot<BotContext>): void {
 
     const statusMsg = await ctx.reply('📋 Генерация суточного отчёта запущена...');
 
+    const threadId = ctx.message?.message_thread_id ?? null;
+
     await reportQueue.add('manual-report', {
       projectId: ctx.project.id,
       date: today,
       statusMessageId: statusMsg.message_id,
       statusChatId: ctx.chat.id,
+      sourceThreadId: threadId,
     });
 
     logger.info({ projectId: ctx.project.id, date: today }, 'Manual report triggered');

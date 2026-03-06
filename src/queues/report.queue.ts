@@ -16,6 +16,7 @@ export interface ReportJobData {
   date: string; // YYYY-MM-DD
   statusMessageId?: number;  // Временное сообщение «Генерация запущена...»
   statusChatId?: number;
+  sourceThreadId?: number | null;  // Топик, откуда вызван /report
 }
 
 export const reportQueue = new Queue(QUEUE_NAME, {
@@ -35,52 +36,78 @@ export function startReportWorker(bot: Bot<BotContext>): Worker {
   const worker = new Worker(
     QUEUE_NAME,
     async (job: Job) => {
-      const { projectId, date, statusMessageId, statusChatId } = job.data as ReportJobData;
+      const { projectId, date, statusMessageId, statusChatId, sourceThreadId } = job.data as ReportJobData;
 
-      // 1. Получаем проект
-      const project = await db('projects').where('id', projectId).first();
-      if (!project) {
-        logger.warn({ projectId }, 'Report skipped: project not found');
-        return;
-      }
+      try {
+        // 1. Получаем проект
+        const project = await db('projects').where('id', projectId).first();
+        if (!project) {
+          logger.warn({ projectId }, 'Report skipped: project not found');
+          return;
+        }
 
-      // 2. Получаем топики для отправки отчёта (только «reports» и «general»)
-      const topicBindings = await db('project_topics')
-        .where('project_id', projectId)
-        .whereIn('topic_type', ['reports', 'general']);
-      if (topicBindings.length === 0) {
-        logger.warn({ projectId }, 'Report skipped: no topic bindings');
-        return;
-      }
+        // 2. Получаем топики для отправки отчёта (только «reports» и «general»)
+        let topicBindings = await db('project_topics')
+          .where('project_id', projectId)
+          .whereIn('topic_type', ['reports', 'general']);
 
-      logger.info({ projectId, projectName: project.name, date, topicsCount: topicBindings.length }, 'Daily report generation started');
+        // Для ручного /report: если нет 'reports'/'general' топиков, используем топик-источник
+        if (topicBindings.length === 0 && statusChatId && sourceThreadId) {
+          const sourceTopic = await db('project_topics')
+            .where('project_id', projectId)
+            .where('telegram_group_id', statusChatId.toString())
+            .where('topic_thread_id', sourceThreadId)
+            .first();
+          if (sourceTopic) {
+            topicBindings = [sourceTopic];
+            logger.info({ projectId }, 'Using source topic as fallback for report');
+          }
+        }
 
-      // 3. Собираем сообщения из буфера за день (по project_id, не по group_id)
-      const messages = await db('message_buffer')
-        .where('project_id', projectId)
-        .where('message_date', date)
-        .orderBy('created_at', 'asc');
+        if (topicBindings.length === 0) {
+          logger.warn({ projectId }, 'Report skipped: no topic bindings');
+          // Уведомляем пользователя
+          if (statusChatId && sourceThreadId) {
+            try {
+              await bot.api.sendMessage(
+                statusChatId,
+                '⚠️ Нет топика с типом «Отчёты». Привяжите топик через /link → 📋 Отчёты.',
+                { message_thread_id: sourceThreadId },
+              );
+            } catch { /* ignore */ }
+          }
+          return;
+        }
 
-      // 4. Генерация суточного отчёта (если есть сообщения)
-      if (messages.length > 0) {
-        await generateDailyReport(bot, project, topicBindings, messages, date);
-      } else {
-        logger.info({ projectId, date }, 'No messages for daily report');
-      }
+        logger.info({ projectId, projectName: project.name, date, topicsCount: topicBindings.length }, 'Daily report generation started');
 
-      // 5. Генерация финансовой сводки (всегда, даже если нет сообщений)
-      await generateFinancialSummary(bot, project, topicBindings, date);
+        // 3. Собираем сообщения из буфера за день (по project_id, не по group_id)
+        const messages = await db('message_buffer')
+          .where('project_id', projectId)
+          .where('message_date', date)
+          .orderBy('created_at', 'asc');
 
-      // 6. Обновление сводки в Google Sheets (fire-and-forget)
-      syncSummaryToSheets().catch((err) =>
-        logger.error({ err }, 'Sheets summary sync failed')
-      );
+        // 4. Генерация суточного отчёта (если есть сообщения)
+        if (messages.length > 0) {
+          await generateDailyReport(bot, project, topicBindings, messages, date);
+        } else {
+          logger.info({ projectId, date }, 'No messages for daily report');
+        }
 
-      // 7. Удаляем временное сообщение «Генерация запущена...»
-      if (statusMessageId && statusChatId) {
-        try {
-          await bot.api.deleteMessage(statusChatId, statusMessageId);
-        } catch { /* уже удалено или нет прав */ }
+        // 5. Генерация финансовой сводки (всегда, даже если нет сообщений)
+        await generateFinancialSummary(bot, project, topicBindings, date);
+
+        // 6. Обновление сводки в Google Sheets (fire-and-forget)
+        syncSummaryToSheets().catch((err) =>
+          logger.error({ err }, 'Sheets summary sync failed')
+        );
+      } finally {
+        // ВСЕГДА удаляем временное сообщение «Генерация запущена...»
+        if (statusMessageId && statusChatId) {
+          try {
+            await bot.api.deleteMessage(statusChatId, statusMessageId);
+          } catch { /* уже удалено или нет прав */ }
+        }
       }
     },
     {
