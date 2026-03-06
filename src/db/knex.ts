@@ -1,4 +1,5 @@
 import Knex from 'knex';
+import path from 'path';
 import { config } from '../config';
 import { logger } from '../utils/logger';
 
@@ -7,7 +8,7 @@ export const db = Knex({
   connection: config.databaseUrl,
   pool: { min: 2, max: 10 },
   migrations: {
-    directory: './src/db/migrations',
+    directory: path.join(__dirname, 'migrations'),
     tableName: 'knex_migrations',
   },
 });

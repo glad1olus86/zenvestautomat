@@ -33,9 +33,11 @@ export const config = {
   googleServiceAccountJson: optional('GOOGLE_SERVICE_ACCOUNT_JSON', ''),
   googleSheetId: optional('GOOGLE_SHEET_ID', ''),
 
-  // whisper.cpp
-  whisperModelPath: optional('WHISPER_MODEL_PATH', './models/ggml-medium.bin'),
-  whisperBinaryPath: optional('WHISPER_BINARY_PATH', './whisper.cpp/main'),
+  // Groq (Whisper STT)
+  groqApiKey: optional('GROQ_API_KEY', ''),
+
+  // Google Drive
+  googleDriveFolderId: optional('GOOGLE_DRIVE_FOLDER_ID', ''),
 
   // Приложение
   dailyReportTime: optional('DAILY_REPORT_TIME', '20:00'),

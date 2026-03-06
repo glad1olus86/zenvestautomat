@@ -1,0 +1,9 @@
+node_modules
+dist
+.env
+.git
+*.log
+credentials
+tests
+SETUP.md
+DEPLOY.md

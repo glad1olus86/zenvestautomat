@@ -14,6 +14,11 @@ export function setupTextMessage(bot: Bot<BotContext>): void {
       return;
     }
 
+    // Только привязанные топики
+    if (!ctx.project) {
+      return;
+    }
+
     const text = ctx.message.text;
 
     // Пропускаем команды бота
