@@ -28,6 +28,7 @@ export const config = {
 
   // Gemini
   geminiApiKey: required('GEMINI_API_KEY'),
+  geminiModel: optional('GEMINI_MODEL', 'gemini-2.5-flash'),
 
   // Google Sheets
   googleServiceAccountJson: optional('GOOGLE_SERVICE_ACCOUNT_JSON', ''),
@@ -36,7 +37,8 @@ export const config = {
   // Groq (Whisper STT)
   groqApiKey: optional('GROQ_API_KEY', ''),
 
-  // Google Drive
+  // Google Drive (пустой = отключен)
+  googleDriveEnabled: optional('GOOGLE_DRIVE_ENABLED', 'true'),
   googleDriveFolderId: optional('GOOGLE_DRIVE_FOLDER_ID', ''),
 
   // Приложение

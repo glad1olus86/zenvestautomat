@@ -16,6 +16,11 @@ const folderCache = new Map<string, string>();
  * Реиспользует тот же service account, что и Sheets.
  */
 export async function initDrive(): Promise<boolean> {
+  if (config.googleDriveEnabled !== 'true') {
+    logger.info('Google Drive disabled via GOOGLE_DRIVE_ENABLED=false');
+    return false;
+  }
+
   if (!config.googleServiceAccountJson || !config.googleDriveFolderId) {
     logger.warn('Google Drive not configured — upload disabled');
     return false;

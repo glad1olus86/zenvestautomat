@@ -16,7 +16,7 @@ import {
   isInvoiceError,
 } from '../prompts/invoiceRecognition';
 
-const MODEL = 'gemini-2.5-flash';
+const MODEL = config.geminiModel;
 
 const ai = new GoogleGenAI({ apiKey: config.geminiApiKey });
 

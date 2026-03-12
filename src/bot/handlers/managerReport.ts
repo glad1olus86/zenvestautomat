@@ -257,10 +257,10 @@ export function setupManagerReport(bot: Bot<BotContext>): void {
     }
 
     session.approved = ctx.match[1];
-
-    // Переход к шагу суммы
-    await showAmountModeStep(bot, ctx.chat!.id, session);
     await ctx.answerCallbackQuery();
+
+    // Переход к шагу суммы (может ждать scanPromise)
+    await showAmountModeStep(bot, ctx.chat!.id, session);
   });
 
   // ════════════════════ Callback: mr:amode ════════════════════
@@ -448,12 +448,13 @@ export function setupManagerReport(bot: Bot<BotContext>): void {
       return;
     }
 
+    await ctx.answerCallbackQuery();
+
     if (ctx.match[1] === 'cancel') {
       if (session.documentPath) cleanupFile(session.documentPath);
       sessions.delete(userId);
       const backKb = new InlineKeyboard().text('← В меню', 'menu:back_fresh');
       await safeEdit(bot, ctx.chat!.id, session.botMessageId, 'Отменено.', backKb);
-      await ctx.answerCallbackQuery();
       return;
     }
 
@@ -527,8 +528,6 @@ export function setupManagerReport(bot: Bot<BotContext>): void {
       if (session.documentPath) cleanupFile(session.documentPath);
       sessions.delete(userId);
     }
-
-    await ctx.answerCallbackQuery();
   });
 
   // ════════════════════ Callback: mr:name_use / mr:name_other ════════════════════
