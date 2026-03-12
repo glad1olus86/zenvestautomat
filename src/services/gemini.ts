@@ -1,7 +1,8 @@
-import { GoogleGenAI } from '@google/genai';
+import { GoogleGenAI, Part } from '@google/genai';
 import fs from 'fs';
 import { config } from '../config';
 import { logger } from '../utils/logger';
+import { convertPdfToImages, cleanupFiles } from '../utils/pdfToImages';
 import {
   RECEIPT_RECOGNITION_PROMPT,
   ReceiptResponse,
@@ -20,91 +21,131 @@ const MODEL = 'gemini-2.5-flash';
 const ai = new GoogleGenAI({ apiKey: config.geminiApiKey });
 
 /**
- * Распознаёт чек из изображения.
+ * Подготавливает файл(ы) для отправки в Gemini.
+ * Если файл — PDF, конвертирует в PNG-изображения.
+ * Возвращает массив inlineData parts и пути к temp-файлам для очистки.
+ */
+async function prepareFileParts(filePath: string): Promise<{
+  parts: Part[];
+  tempFiles: string[];
+}> {
+  const ext = filePath.toLowerCase().split('.').pop();
+  const isPdf = ext === 'pdf';
+
+  if (isPdf) {
+    // Конвертируем PDF в изображения
+    const imagePaths = await convertPdfToImages(filePath);
+
+    const parts: Part[] = imagePaths.map((imgPath) => {
+      const buffer = fs.readFileSync(imgPath);
+      return {
+        inlineData: {
+          mimeType: 'image/png',
+          data: buffer.toString('base64'),
+        },
+      };
+    });
+
+    return { parts, tempFiles: imagePaths };
+  }
+
+  // Обычное изображение
+  const buffer = fs.readFileSync(filePath);
+  const mimeMap: Record<string, string> = {
+    jpg: 'image/jpeg',
+    jpeg: 'image/jpeg',
+    png: 'image/png',
+    webp: 'image/webp',
+  };
+  const mimeType = mimeMap[ext || ''] || 'image/jpeg';
+
+  return {
+    parts: [{
+      inlineData: {
+        mimeType,
+        data: buffer.toString('base64'),
+      },
+    }],
+    tempFiles: [],
+  };
+}
+
+/**
+ * Распознаёт чек из изображения или PDF.
+ * PDF автоматически конвертируется в изображения (по странице).
  * Возвращает ReceiptData при успехе или null при ошибке.
  */
 export async function recognizeReceipt(imagePath: string): Promise<{
   data: ReceiptData | null;
   raw: any;
 }> {
-  const imageBuffer = fs.readFileSync(imagePath);
-  const base64 = imageBuffer.toString('base64');
+  let tempFiles: string[] = [];
 
-  // Определяем MIME тип
-  const ext = imagePath.toLowerCase().split('.').pop();
-  const mimeMap: Record<string, string> = {
-    jpg: 'image/jpeg',
-    jpeg: 'image/jpeg',
-    png: 'image/png',
-    webp: 'image/webp',
-    pdf: 'application/pdf',
-  };
-  const mimeType = mimeMap[ext || ''] || 'image/jpeg';
+  try {
+    const prepared = await prepareFileParts(imagePath);
+    tempFiles = prepared.tempFiles;
 
-  let lastError: any;
+    let lastError: any;
 
-  // 3 попытки с exponential backoff
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    try {
-      const response = await ai.models.generateContent({
-        model: MODEL,
-        contents: [
-          {
-            role: 'user',
-            parts: [
-              { text: RECEIPT_RECOGNITION_PROMPT },
-              {
-                inlineData: {
-                  mimeType,
-                  data: base64,
-                },
-              },
-            ],
-          },
-        ],
-      });
+    // 3 попытки с exponential backoff
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        const response = await ai.models.generateContent({
+          model: MODEL,
+          contents: [
+            {
+              role: 'user',
+              parts: [
+                { text: RECEIPT_RECOGNITION_PROMPT },
+                ...prepared.parts,
+              ],
+            },
+          ],
+        });
 
-      const text = response.text?.trim();
+        const text = response.text?.trim();
 
-      if (!text) {
-        logger.warn({ attempt }, 'Gemini returned empty response for receipt');
-        lastError = new Error('Empty response');
-        continue;
-      }
+        if (!text) {
+          logger.warn({ attempt }, 'Gemini returned empty response for receipt');
+          lastError = new Error('Empty response');
+          continue;
+        }
 
-      // Парсим JSON (убираем markdown-обёртку если есть)
-      const jsonStr = text.replace(/^```json\s*/, '').replace(/\s*```$/, '');
-      const parsed: ReceiptResponse = JSON.parse(jsonStr);
+        // Парсим JSON (убираем markdown-обёртку если есть)
+        const jsonStr = text.replace(/^```json\s*/, '').replace(/\s*```$/, '');
+        const parsed: ReceiptResponse = JSON.parse(jsonStr);
 
-      if (isReceiptError(parsed)) {
-        logger.info({ error: parsed.error }, 'Receipt not recognized by Gemini');
-        return { data: null, raw: parsed };
-      }
+        if (isReceiptError(parsed)) {
+          logger.info({ error: parsed.error }, 'Receipt not recognized by Gemini');
+          return { data: null, raw: parsed };
+        }
 
-      // Валидация обязательных полей
-      if (!parsed.amount || !parsed.currency) {
-        logger.warn({ parsed }, 'Gemini returned incomplete receipt data');
-        return { data: null, raw: parsed };
-      }
+        // Валидация обязательных полей
+        if (!parsed.amount || !parsed.currency) {
+          logger.warn({ parsed }, 'Gemini returned incomplete receipt data');
+          return { data: null, raw: parsed };
+        }
 
-      return { data: parsed, raw: parsed };
-    } catch (err: any) {
-      lastError = err;
-      logger.warn({ attempt, err: err.message }, 'Gemini receipt recognition attempt failed');
+        return { data: parsed, raw: parsed };
+      } catch (err: any) {
+        lastError = err;
+        logger.warn({ attempt, err: err.message }, 'Gemini receipt recognition attempt failed');
 
-      if (attempt < 3) {
-        await new Promise((r) => setTimeout(r, 1000 * Math.pow(2, attempt)));
+        if (attempt < 3) {
+          await new Promise((r) => setTimeout(r, 1000 * Math.pow(2, attempt)));
+        }
       }
     }
-  }
 
-  logger.error({ err: lastError }, 'Gemini receipt recognition failed after 3 attempts');
-  return { data: null, raw: { error: lastError?.message } };
+    logger.error({ err: lastError }, 'Gemini receipt recognition failed after 3 attempts');
+    return { data: null, raw: { error: lastError?.message } };
+  } finally {
+    cleanupFiles(tempFiles);
+  }
 }
 
 /**
  * Суммаризирует массив сообщений в суточный отчёт.
- * (Будет использоваться в шаге 5)
  */
 export async function summarizeMessages(
   messages: { userName: string; content: string }[],
@@ -172,74 +213,66 @@ ${messageList}
 
 /**
  * Распознаёт счёт/фактуру из изображения или PDF.
+ * PDF автоматически конвертируется в изображения (по странице).
  * Возвращает InvoiceExtraction при успехе или null при ошибке.
  */
 export async function recognizeInvoice(filePath: string): Promise<{
   data: InvoiceExtraction | null;
   raw: any;
 }> {
-  const fileBuffer = fs.readFileSync(filePath);
-  const base64 = fileBuffer.toString('base64');
+  let tempFiles: string[] = [];
 
-  const ext = filePath.toLowerCase().split('.').pop();
-  const mimeMap: Record<string, string> = {
-    jpg: 'image/jpeg',
-    jpeg: 'image/jpeg',
-    png: 'image/png',
-    webp: 'image/webp',
-    pdf: 'application/pdf',
-  };
-  const mimeType = mimeMap[ext || ''] || 'image/jpeg';
+  try {
+    const prepared = await prepareFileParts(filePath);
+    tempFiles = prepared.tempFiles;
 
-  let lastError: any;
+    let lastError: any;
 
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    try {
-      const response = await ai.models.generateContent({
-        model: MODEL,
-        contents: [
-          {
-            role: 'user',
-            parts: [
-              { text: INVOICE_RECOGNITION_PROMPT },
-              {
-                inlineData: {
-                  mimeType,
-                  data: base64,
-                },
-              },
-            ],
-          },
-        ],
-      });
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      try {
+        const response = await ai.models.generateContent({
+          model: MODEL,
+          contents: [
+            {
+              role: 'user',
+              parts: [
+                { text: INVOICE_RECOGNITION_PROMPT },
+                ...prepared.parts,
+              ],
+            },
+          ],
+        });
 
-      const text = response.text?.trim();
+        const text = response.text?.trim();
 
-      if (!text) {
-        logger.warn({ attempt }, 'Gemini returned empty response for invoice');
-        lastError = new Error('Empty response');
-        continue;
-      }
+        if (!text) {
+          logger.warn({ attempt }, 'Gemini returned empty response for invoice');
+          lastError = new Error('Empty response');
+          continue;
+        }
 
-      const jsonStr = text.replace(/^```json\s*/, '').replace(/\s*```$/, '');
-      const parsed: InvoiceResponse = JSON.parse(jsonStr);
+        const jsonStr = text.replace(/^```json\s*/, '').replace(/\s*```$/, '');
+        const parsed: InvoiceResponse = JSON.parse(jsonStr);
 
-      if (isInvoiceError(parsed)) {
-        logger.info({ error: parsed.error }, 'Invoice not recognized by Gemini');
-        return { data: null, raw: parsed };
-      }
+        if (isInvoiceError(parsed)) {
+          logger.info({ error: parsed.error }, 'Invoice not recognized by Gemini');
+          return { data: null, raw: parsed };
+        }
 
-      return { data: parsed as InvoiceExtraction, raw: parsed };
-    } catch (err: any) {
-      lastError = err;
-      logger.warn({ attempt, err: err.message }, 'Gemini invoice recognition attempt failed');
+        return { data: parsed as InvoiceExtraction, raw: parsed };
+      } catch (err: any) {
+        lastError = err;
+        logger.warn({ attempt, err: err.message }, 'Gemini invoice recognition attempt failed');
 
-      if (attempt < 3) {
-        await new Promise((r) => setTimeout(r, 1000 * Math.pow(2, attempt)));
+        if (attempt < 3) {
+          await new Promise((r) => setTimeout(r, 1000 * Math.pow(2, attempt)));
+        }
       }
     }
-  }
 
-  logger.error({ err: lastError }, 'Gemini invoice recognition failed after 3 attempts');
-  return { data: null, raw: { error: lastError?.message } };
+    logger.error({ err: lastError }, 'Gemini invoice recognition failed after 3 attempts');
+    return { data: null, raw: { error: lastError?.message } };
+  } finally {
+    cleanupFiles(tempFiles);
+  }
 }

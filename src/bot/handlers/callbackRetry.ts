@@ -29,8 +29,13 @@ export function setupCallbackRetry(bot: Bot<BotContext>): void {
         return;
       }
 
+      // Определяем расширение через Telegram API
+      const fileInfo = await ctx.api.getFile(receipt.file_id);
+      const ext = fileInfo.file_path?.match(/\.(\w+)$/)?.[1];
+      const extension = ext === 'pdf' ? '.pdf' : '.jpg';
+
       // Скачиваем файл заново по file_id (file_id не истекает)
-      const imagePath = await downloadTelegramFile(ctx.api, receipt.file_id, '.jpg');
+      const imagePath = await downloadTelegramFile(ctx.api, receipt.file_id, extension);
 
       // Сбрасываем статус
       await db('receipts')
