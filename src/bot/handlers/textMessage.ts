@@ -26,6 +26,11 @@ export function setupTextMessage(bot: Bot<BotContext>): void {
       return;
     }
 
+    // Пропускаем REPORT-сообщения (обработаны reportMessage.ts)
+    if (/^\s*REPORT\b/i.test(text)) {
+      return;
+    }
+
     const chatId = ctx.chat.id;
     const userId = ctx.from.id;
     const userName = [ctx.from.first_name, ctx.from.last_name].filter(Boolean).join(' ');

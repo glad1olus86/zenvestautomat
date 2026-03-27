@@ -41,7 +41,12 @@ export const config = {
   googleDriveEnabled: optional('GOOGLE_DRIVE_ENABLED', 'true'),
   googleDriveFolderId: optional('GOOGLE_DRIVE_FOLDER_ID', ''),
 
+  // Группа руководства (алерты о пропущенных отчётах)
+  managementGroupId: optional('MANAGEMENT_GROUP_ID', ''),
+  managementTopicId: optional('MANAGEMENT_TOPIC_ID', ''),
+
   // Приложение
   dailyReportTime: optional('DAILY_REPORT_TIME', '20:00'),
+  reportReminderTime: optional('REPORT_REMINDER_TIME', '18:00'),
   timezone: optional('TIMEZONE', 'Europe/Prague'),
 };

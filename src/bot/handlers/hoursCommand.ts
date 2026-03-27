@@ -14,6 +14,7 @@ interface HoursSession {
   workerName: string;
   workerType: string;
   createdAt: number;
+  fromMenu?: boolean;  // Запущен из /menu
 }
 
 // Ключ: `${chatId}:${userId}` (в группе могут быть параллельные сессии)
@@ -82,6 +83,40 @@ async function showWorkerSelection(
   }
 
   await safeEdit(bot, chatId, messageId, text, kb);
+}
+
+// ─── Public API (для groupMenu) ───
+
+/**
+ * Запускает wizard часов на существующем сообщении (из /menu).
+ */
+export async function startHoursOnMessage(
+  bot: Bot<BotContext>,
+  chatId: number,
+  userId: number,
+  messageId: number,
+  username: string | undefined,
+): Promise<void> {
+  const key = sessionKey(chatId, userId);
+  cleanup();
+
+  // Сбрасываем старую сессию если есть
+  const existing = sessions.get(key);
+  if (existing && existing.botMessageId !== messageId) {
+    await safeDelete(bot, chatId, existing.botMessageId);
+  }
+
+  sessions.set(key, {
+    step: 'worker',
+    botMessageId: messageId,
+    workerId: null,
+    workerName: '',
+    workerType: '',
+    createdAt: Date.now(),
+    fromMenu: true,
+  });
+
+  await showWorkerSelection(bot, chatId, messageId, username);
 }
 
 // ─── Handler ───
@@ -313,7 +348,7 @@ async function saveHours(
 
     const kb = new InlineKeyboard()
       .text('Ещё одному', 'hr:more')
-      .text('Готово', 'hr:done');
+      .text(session.fromMenu ? 'В меню' : 'Готово', session.fromMenu ? 'gm:back' : 'hr:done');
 
     await safeEdit(bot, chatId, session.botMessageId,
       `✅ Часы записаны:\n` +

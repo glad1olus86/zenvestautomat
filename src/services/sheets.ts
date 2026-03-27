@@ -49,6 +49,8 @@ const FIRST_RECEIPT_ROW = 17;
 const HOURS_COL_START = 'L';
 
 const SUMMARY_SHEET = 'Сводка';
+const REPORTS_SHEET = 'REPORTS';
+const TASKS_SHEET = 'TASKS';
 
 // ─── Инициализация ───
 
@@ -83,8 +85,10 @@ export async function initSheets(): Promise<boolean> {
     formulaSep = semiLocales.test(locale) ? ';' : ',';
     logger.info({ locale, formulaSep }, 'Spreadsheet locale detected');
 
-    // Убеждаемся что лист «Сводка» существует
+    // Убеждаемся что служебные листы существуют
     await ensureSummarySheet();
+    await ensureReportsSheet();
+    await ensureTasksSheet();
 
     // Создаём листы для всех уже зарегистрированных проектов
     const projects = await db('projects').select('id', 'name');
@@ -619,6 +623,144 @@ export async function syncWorkerHoursToSheets(workerHoursId: number): Promise<vo
   }
 }
 
+// ─── PG → Sheets: синхронизация всех часов (GPS + ручные) ───
+
+/**
+ * Объединяет GPS-часы (gps_work_hours) и ручные часы (worker_hours) по проекту
+ * и записывает в L:O на лист проекта. GPS-рабочие имеют приоритет.
+ */
+export async function syncAllHoursToSheets(projectId: number): Promise<void> {
+  if (!sheetsClient) return;
+
+  try {
+    const project = await db('projects').where('id', projectId).first();
+    if (!project) return;
+
+    const sheetName = project.name;
+    const client = getClient();
+
+    // 1. GPS-часы (все даты, сгруппированные по рабочему)
+    const gpsHoursAgg = await db('gps_work_hours')
+      .join('vehicles', 'gps_work_hours.vehicle_id', 'vehicles.id')
+      .join('workers', 'vehicles.worker_id', 'workers.id')
+      .where('gps_work_hours.project_id', projectId)
+      .whereNotNull('gps_work_hours.hours')
+      .groupBy('workers.id', 'workers.name', 'workers.hourly_rate')
+      .select(
+        'workers.name as worker_name',
+        'workers.hourly_rate',
+        db.raw('SUM(gps_work_hours.hours) as total_hours'),
+      );
+
+    // 2. GPS-трекаемые рабочие (имена)
+    const gpsWorkerNames = new Set(gpsHoursAgg.map((r: any) => r.worker_name));
+
+    // 3. Ручные часы (только не-GPS рабочие, все даты)
+    const gpsTrackedNames: string[] = await db('workers')
+      .join('vehicles', 'vehicles.worker_id', 'workers.id')
+      .whereNotNull('vehicles.vin')
+      .pluck('workers.name');
+    const gpsTrackedSet = new Set(gpsTrackedNames);
+
+    const manualHoursAgg = await db('worker_hours')
+      .where('project_id', projectId)
+      .whereNotIn('worker_name', gpsTrackedNames.length > 0 ? gpsTrackedNames : ['__none__'])
+      .groupBy('worker_name')
+      .select('worker_name')
+      .sum('hours as total_hours');
+
+    // 4. Ставки из БД
+    const allWorkers = await db('workers').select('name', 'hourly_rate');
+    const dbRateMap = new Map<string, number>();
+    for (const w of allWorkers) {
+      if (w.hourly_rate) dbRateMap.set(w.name, parseFloat(w.hourly_rate));
+    }
+
+    // Ставки из Sheets (fallback)
+    const totalRows = gpsHoursAgg.length + manualHoursAgg.length;
+    const clearEnd = FIRST_WORKER_ROW + Math.max(totalRows, 20) + 2;
+    const existingRatesResp = await client.spreadsheets.values.get({
+      spreadsheetId,
+      range: `'${sheetName}'!L${FIRST_WORKER_ROW}:M${clearEnd}`,
+    }).catch(() => null);
+
+    const sheetRateMap = new Map<string, number>();
+    if (existingRatesResp?.data.values) {
+      for (const row of existingRatesResp.data.values) {
+        if (row[0] && row[1]) {
+          const rate = parseFloat(String(row[1]).replace(/,/g, '.'));
+          if (!isNaN(rate)) sheetRateMap.set(row[0], rate);
+        }
+      }
+    }
+
+    // 5. Объединяем: GPS-рабочие + ручные (не-GPS)
+    const workerDataRows: (string | number)[][] = [];
+
+    for (const w of gpsHoursAgg) {
+      const hours = parseFloat(w.total_hours || '0');
+      const rate = w.hourly_rate ? parseFloat(w.hourly_rate) : (dbRateMap.get(w.worker_name) ?? sheetRateMap.get(w.worker_name) ?? '');
+      workerDataRows.push([w.worker_name, rate, hours] as (string | number)[]);
+    }
+
+    for (const w of manualHoursAgg) {
+      const hours = parseFloat(w.total_hours || '0');
+      const rate = dbRateMap.get(w.worker_name) ?? sheetRateMap.get(w.worker_name) ?? '';
+      workerDataRows.push([w.worker_name, rate, hours] as (string | number)[]);
+    }
+
+    if (workerDataRows.length > 0) {
+      // Очищаем старые данные
+      await client.spreadsheets.values.clear({
+        spreadsheetId,
+        range: `'${sheetName}'!L${FIRST_WORKER_ROW}:O${clearEnd}`,
+      });
+
+      // L-N: данные (RAW)
+      await client.spreadsheets.values.update({
+        spreadsheetId,
+        range: `'${sheetName}'!L${FIRST_WORKER_ROW}`,
+        valueInputOption: 'RAW',
+        requestBody: { values: workerDataRows },
+      });
+
+      const lastWorkerRow = FIRST_WORKER_ROW + workerDataRows.length - 1;
+      const totalsRow = lastWorkerRow + 1;
+
+      // Итого
+      await client.spreadsheets.values.update({
+        spreadsheetId,
+        range: `'${sheetName}'!L${totalsRow}`,
+        valueInputOption: 'RAW',
+        requestBody: { values: [['Итого', '', '', '']] },
+      });
+
+      // Формулы: O = M*N для каждого + итоги
+      const sid = await getSheetId(sheetName);
+      if (sid !== null) {
+        const formulas: Array<{ row: number; col: number; formula: string }> = [];
+
+        for (let i = 0; i < workerDataRows.length; i++) {
+          const r = FIRST_WORKER_ROW + i;
+          formulas.push({ row: r - 1, col: 14, formula: `=M${r}*N${r}` });
+        }
+
+        formulas.push({ row: totalsRow - 1, col: 13, formula: `=SUM(N${FIRST_WORKER_ROW}:N${lastWorkerRow})` });
+        formulas.push({ row: totalsRow - 1, col: 14, formula: `=SUM(O${FIRST_WORKER_ROW}:O${lastWorkerRow})` });
+
+        await writeFormulas(sid, formulas);
+      }
+    }
+
+    // Обновляем бюджет (секция часов)
+    await updateBudgetSection(project);
+
+    logger.debug({ projectId, sheetName, workers: workerDataRows.length }, 'All hours (GPS+manual) synced to project sheet');
+  } catch (err) {
+    logger.error({ err, projectId }, 'Failed to sync all hours to Sheets');
+  }
+}
+
 // ─── PG → Sheets: обновление сводки ───
 
 /**
@@ -633,13 +775,26 @@ export async function syncSummaryToSheets(): Promise<void> {
 
     const rows: any[][] = [[
       'Объект',
-      'Бюджет (CZK)',
-      'Потрачено (CZK)',
-      'Остаток (CZK)',
-      'Заложено часов',
-      'Израсходовано часов',
-      'Остаток часов',
+      'Бюджет материалы (CZK)',
+      'Потрачено материалы (CZK)',
+      'Остаток материалы (CZK)',
+      'Бюджет работы (CZK)',
+      'Потрачено работы (CZK)',
+      'Остаток работы (CZK)',
     ]];
+
+    // Ставки рабочих (общий запрос на все проекты)
+    const allWorkers = await db('workers').select('name', 'hourly_rate');
+    const rateMap = new Map<string, number>();
+    for (const w of allWorkers) {
+      if (w.hourly_rate) rateMap.set(w.name, parseFloat(w.hourly_rate));
+    }
+
+    // GPS-трекаемые рабочие
+    const gpsTracked: string[] = await db('workers')
+      .join('vehicles', 'vehicles.worker_id', 'workers.id')
+      .whereNotNull('vehicles.vin')
+      .pluck('workers.name');
 
     for (const project of projects) {
       const totalResult = await db('receipts')
@@ -649,22 +804,43 @@ export async function syncSummaryToSheets(): Promise<void> {
         .first();
       const spentTotal = parseFloat(totalResult?.total || '0');
       const budget = parseFloat(project.budget_czk || '0');
-      const allocatedHours = parseFloat(project.allocated_hours || '0');
+      const laborBudget = parseFloat(project.labor_budget_czk || '0');
 
-      const hoursResult = await db('worker_hours')
-        .where('project_id', project.id)
-        .sum('hours as total')
-        .first();
-      const spentHours = parseFloat(hoursResult?.total || '0');
+      // Стоимость работ: GPS (часы × ставка)
+      const gpsLaborRows = await db('gps_work_hours')
+        .join('vehicles', 'gps_work_hours.vehicle_id', 'vehicles.id')
+        .join('workers', 'vehicles.worker_id', 'workers.id')
+        .where('gps_work_hours.project_id', project.id)
+        .whereNotNull('gps_work_hours.hours')
+        .groupBy('workers.id', 'workers.name', 'workers.hourly_rate')
+        .select('workers.name as worker_name', 'workers.hourly_rate', db.raw('SUM(gps_work_hours.hours) as total_hours'));
+
+      let spentLabor = 0;
+      for (const row of gpsLaborRows) {
+        const hours = parseFloat(row.total_hours || '0');
+        const rate = row.hourly_rate ? parseFloat(row.hourly_rate) : (rateMap.get(row.worker_name) ?? 0);
+        spentLabor += hours * rate;
+      }
+
+      // Стоимость работ: ручные (не-GPS рабочие)
+      const manualQuery = db('worker_hours').where('project_id', project.id);
+      if (gpsTracked.length > 0) manualQuery.whereNotIn('worker_name', gpsTracked);
+      const manualLaborRows = await manualQuery.groupBy('worker_name').select('worker_name').sum('hours as total_hours');
+
+      for (const row of manualLaborRows) {
+        const hours = parseFloat(row.total_hours || '0');
+        const rate = rateMap.get(row.worker_name) ?? 0;
+        spentLabor += hours * rate;
+      }
 
       rows.push([
         project.name,
         budget,
         spentTotal,
         budget - spentTotal,
-        allocatedHours,
-        spentHours,
-        allocatedHours - spentHours,
+        laborBudget,
+        Math.round(spentLabor * 100) / 100,
+        Math.round((laborBudget - spentLabor) * 100) / 100,
       ]);
     }
 
@@ -805,11 +981,14 @@ export async function pullChangesFromSheets(): Promise<void> {
   if (!sheetsClient) return;
 
   try {
-    const projects = await db('projects').select('id', 'name', 'budget_czk', 'allocated_hours');
+    const projects = await db('projects').select('id', 'name', 'budget_czk', 'labor_budget_czk');
 
     for (const project of projects) {
       await pullProjectDataFromSheet(project);
     }
+
+    // Обратная синхронизация статусов задач
+    await pullTaskStatusFromSheets();
 
     logger.debug('Sheets → PG sync completed');
   } catch (err) {
@@ -831,20 +1010,20 @@ async function pullProjectDataFromSheet(project: any): Promise<void> {
     const budgetRow = budgetResp.data.values?.[0];
     if (budgetRow) {
       const budgetCzk = parseFloat(String(budgetRow[1]).replace(/,/g, '.').replace(/[^0-9.-]/g, '')) || 0;
-      const allocatedHours = parseFloat(String(budgetRow[4] || '').replace(/,/g, '.').replace(/[^0-9.-]/g, '')) || 0;
+      const laborBudgetCzk = parseFloat(String(budgetRow[4] || '').replace(/,/g, '.').replace(/[^0-9.-]/g, '')) || 0;
 
       // Обновляем только если значения изменились
       if (budgetCzk !== parseFloat(project.budget_czk || '0') ||
-        allocatedHours !== parseFloat(project.allocated_hours || '0')) {
+        laborBudgetCzk !== parseFloat(project.labor_budget_czk || '0')) {
         await db('projects')
           .where('id', project.id)
           .update({
             budget_czk: budgetCzk || project.budget_czk,
-            allocated_hours: allocatedHours || project.allocated_hours,
+            labor_budget_czk: laborBudgetCzk || project.labor_budget_czk,
             updated_at: new Date(),
           });
 
-        logger.debug({ projectId: project.id, budgetCzk, allocatedHours }, 'Project updated from Sheets');
+        logger.debug({ projectId: project.id, budgetCzk, laborBudgetCzk }, 'Project updated from Sheets');
       }
     }
   } catch (err: any) {
@@ -854,6 +1033,230 @@ async function pullProjectDataFromSheet(project: any): Promise<void> {
     } else {
       logger.error({ err, sheetName }, 'Failed to pull project data from Sheets');
     }
+  }
+}
+
+// ─── REPORTS / TASKS табы ───
+
+async function ensureReportsSheet(): Promise<void> {
+  const client = getClient();
+  const meta = await client.spreadsheets.get({
+    spreadsheetId,
+    fields: 'sheets.properties.title',
+  });
+  const existing = new Set(meta.data.sheets?.map((s) => s.properties?.title) || []);
+  if (existing.has(REPORTS_SHEET)) return;
+
+  await client.spreadsheets.batchUpdate({
+    spreadsheetId,
+    requestBody: {
+      requests: [{ addSheet: { properties: { title: REPORTS_SHEET } } }],
+    },
+  });
+
+  await client.spreadsheets.values.update({
+    spreadsheetId,
+    range: `'${REPORTS_SHEET}'!A1:K1`,
+    valueInputOption: 'RAW',
+    requestBody: {
+      values: [[
+        'Дата', 'Объект', 'Менеджер', 'Сделано', 'Проблемы',
+        'Доп. работы', 'Нужно заказать', 'План завтра',
+        'Потрачено на работу (CZK)', 'Потрачено на материал (CZK)', 'Ссылка',
+      ]],
+    },
+  });
+
+  logger.info('REPORTS sheet created');
+}
+
+async function ensureTasksSheet(): Promise<void> {
+  const client = getClient();
+  const meta = await client.spreadsheets.get({
+    spreadsheetId,
+    fields: 'sheets.properties.title',
+  });
+  const existing = new Set(meta.data.sheets?.map((s) => s.properties?.title) || []);
+  if (existing.has(TASKS_SHEET)) return;
+
+  await client.spreadsheets.batchUpdate({
+    spreadsheetId,
+    requestBody: {
+      requests: [{ addSheet: { properties: { title: TASKS_SHEET } } }],
+    },
+  });
+
+  await client.spreadsheets.values.update({
+    spreadsheetId,
+    range: `'${TASKS_SHEET}'!A1:G1`,
+    valueInputOption: 'RAW',
+    requestBody: {
+      values: [['Дата', 'Объект', 'Задача', 'Источник', 'Статус', 'Кто создал', 'Дата выполнения']],
+    },
+  });
+
+  logger.info('TASKS sheet created');
+}
+
+/**
+ * Синхронизирует manager_report в таб REPORTS.
+ */
+export async function syncManagerReportToSheets(reportId: number): Promise<void> {
+  if (!sheetsClient) return;
+
+  try {
+    const report = await db('manager_reports').where('id', reportId).first();
+    if (!report) return;
+
+    const project = await db('projects').where('id', report.project_id).first();
+    if (!project) return;
+
+    const client = getClient();
+    const targetRow = await findNextEmptyRow(REPORTS_SHEET, 'A', 2);
+
+    await client.spreadsheets.values.update({
+      spreadsheetId,
+      range: `'${REPORTS_SHEET}'!A${targetRow}:K${targetRow}`,
+      valueInputOption: 'RAW',
+      requestBody: {
+        values: [[
+          formatDateShort(report.report_date),
+          project.name,
+          report.manager_name,
+          report.done_block || '',
+          report.problems_block || '',
+          report.extra_work_block || '',
+          report.need_to_order_block || '',
+          report.plan_tomorrow_block || '',
+          parseFloat(report.spent_on_work_czk || '0'),
+          parseFloat(report.spent_on_materials_czk || '0'),
+          report.message_link || '',
+        ]],
+      },
+    });
+
+    await db('manager_reports').where('id', reportId).update({
+      synced_to_sheets: true,
+      sheet_row: targetRow,
+    });
+
+    logger.debug({ reportId, targetRow }, 'Manager report synced to Sheets');
+  } catch (err) {
+    logger.error({ err, reportId }, 'Failed to sync manager report to Sheets');
+  }
+}
+
+/**
+ * Синхронизирует все несинхронизированные tasks проекта за дату в таб TASKS.
+ * Если задача уже имеет sheet_row — обновляет существующую строку.
+ * Если нет — создаёт новую.
+ */
+export async function syncTasksToSheets(projectId: number, date: string): Promise<void> {
+  if (!sheetsClient) return;
+
+  try {
+    const tasks = await db('tasks')
+      .where('project_id', projectId)
+      .where('created_date', date)
+      .where('synced_to_sheets', false);
+
+    if (tasks.length === 0) return;
+
+    const project = await db('projects').where('id', projectId).first();
+    if (!project) return;
+
+    const client = getClient();
+
+    for (const task of tasks) {
+      // Если задача уже записана в Sheets — обновляем ту же строку
+      const targetRow = task.sheet_row || await findNextEmptyRow(TASKS_SHEET, 'A', 2);
+
+      const sourceLabel = task.source_section === 'need_to_order'
+        ? 'Нужно заказать'
+        : task.source_section === 'plan_tomorrow'
+        ? 'План'
+        : 'Доп. работы';
+
+      const statusLabel = task.status === 'done' ? 'Выполнена'
+        : task.status === 'rejected' ? 'Отклонена'
+        : 'Открыта';
+
+      const completedDate = task.completed_date
+        ? formatDateShort(task.completed_date)
+        : '';
+
+      await client.spreadsheets.values.update({
+        spreadsheetId,
+        range: `'${TASKS_SHEET}'!A${targetRow}:G${targetRow}`,
+        valueInputOption: 'RAW',
+        requestBody: {
+          values: [[
+            formatDateShort(task.created_date),
+            project.name,
+            task.description,
+            sourceLabel,
+            statusLabel,
+            task.reported_by || '',
+            completedDate,
+          ]],
+        },
+      });
+
+      await db('tasks').where('id', task.id).update({
+        synced_to_sheets: true,
+        sheet_row: targetRow,
+      });
+    }
+
+    logger.debug({ projectId, date, count: tasks.length }, 'Tasks synced to Sheets');
+  } catch (err) {
+    logger.error({ err, projectId, date }, 'Failed to sync tasks to Sheets');
+  }
+}
+
+/**
+ * Обратная синхронизация статусов задач из таба TASKS.
+ */
+export async function pullTaskStatusFromSheets(): Promise<void> {
+  if (!sheetsClient) return;
+
+  try {
+    const client = getClient();
+
+    const resp = await client.spreadsheets.values.get({
+      spreadsheetId,
+      range: `'${TASKS_SHEET}'!A2:G1000`,
+    }).catch(() => null);
+
+    if (!resp?.data.values) return;
+
+    // Найти задачи со статусом "Выполнена" и обновить в БД
+    const openTasks = await db('tasks').where('status', 'open').whereNotNull('sheet_row');
+
+    for (const task of openTasks) {
+      const rowIndex = task.sheet_row - 2; // sheet_row is 1-indexed, data starts row 2
+      if (rowIndex < 0 || rowIndex >= resp.data.values.length) continue;
+
+      const row = resp.data.values[rowIndex];
+      const sheetStatus = String(row[4] || '').trim().toLowerCase();
+
+      let newStatus: string | null = null;
+      if (sheetStatus === 'выполнена' || sheetStatus === 'done') {
+        newStatus = 'done';
+      } else if (sheetStatus === 'отклонена' || sheetStatus === 'rejected') {
+        newStatus = 'rejected';
+      }
+
+      if (newStatus) {
+        await db('tasks').where('id', task.id).update({
+          status: newStatus,
+          completed_date: new Date().toLocaleDateString('en-CA', { timeZone: 'Europe/Prague' }),
+          updated_at: new Date(),
+        });
+      }
+    }
+  } catch (err) {
+    logger.error({ err }, 'Failed to pull task status from Sheets');
   }
 }
 
@@ -913,7 +1316,6 @@ async function updateBudgetSection(project: any): Promise<void> {
 
   const budget = parseFloat(project.budget_czk || '0');
   const laborBudget = parseFloat(project.labor_budget_czk || '0');
-  const allocatedHours = parseFloat(project.allocated_hours || '0');
 
   // A12: название, B12: бюджет материалов (входное значение)
   await client.spreadsheets.values.update({
@@ -925,23 +1327,13 @@ async function updateBudgetSection(project: any): Promise<void> {
     },
   });
 
-  // E12: заложено работы (входное значение)
+  // E12: заложено работы CZK (входное значение)
   await client.spreadsheets.values.update({
     spreadsheetId,
     range: `'${sheetName}'!E${BUDGET_DATA_ROW}`,
     valueInputOption: 'RAW',
     requestBody: {
       values: [[laborBudget]],
-    },
-  });
-
-  // E14: план часов (входное значение)
-  await client.spreadsheets.values.update({
-    spreadsheetId,
-    range: `'${sheetName}'!E${HOURS_HEADERS_ROW}`,
-    valueInputOption: 'RAW',
-    requestBody: {
-      values: [[allocatedHours]],
     },
   });
 }

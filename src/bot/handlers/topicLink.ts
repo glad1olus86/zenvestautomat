@@ -7,6 +7,7 @@ import { logger } from '../../utils/logger';
 const TOPIC_TYPE_LABELS: Record<string, string> = {
   reports: '📋 Отчёты',
   receipts: '🧾 Чеки',
+  issues: '❓ Вопросы',
   general: '📌 Общий',
 };
 
@@ -29,15 +30,8 @@ export function setupTopicLink(bot: Bot<BotContext>): void {
       return;
     }
 
-    const threadId = ctx.message?.message_thread_id;
-    if (!threadId) {
-      await ctx.reply(
-        '⚠️ Команду /link нужно отправлять из топика (треда).\n' +
-        'Зайдите в нужный топик и повторите команду.'
-      );
-      return;
-    }
-
+    // General topic has no thread_id — use 0 as marker in DB
+    const threadId = ctx.message?.message_thread_id ?? 0;
     const chatId = ctx.chat.id;
 
     try {
@@ -115,14 +109,14 @@ export function setupTopicLink(bot: Bot<BotContext>): void {
 
   // ────────────────── Callback: выбор типа топика ──────────────────
 
-  bot.callbackQuery(/^link:t:(\d+):(reports|receipts)$/, async (ctx) => {
+  bot.callbackQuery(/^link:t:(\d+):(reports|receipts|issues)$/, async (ctx) => {
     const projectId = parseInt(ctx.match[1], 10);
-    const topicType = ctx.match[2] as 'reports' | 'receipts';
+    const topicType = ctx.match[2] as 'reports' | 'receipts' | 'issues';
 
     const chatId = ctx.callbackQuery.message?.chat?.id;
-    const threadId = ctx.callbackQuery.message?.message_thread_id;
+    const threadId = ctx.callbackQuery.message?.message_thread_id ?? 0;
 
-    if (!chatId || !threadId) {
+    if (!chatId) {
       await ctx.answerCallbackQuery({ text: 'Не удалось определить топик' });
       return;
     }
@@ -161,9 +155,13 @@ export function setupTopicLink(bot: Bot<BotContext>): void {
       );
 
       const typeLabel = TOPIC_TYPE_LABELS[topicType];
-      const typeDesc = topicType === 'reports'
-        ? 'Суточные отчёты будут приходить в этот топик.'
-        : 'Суточные отчёты НЕ будут приходить в этот топик.';
+      const typeDescs: Record<string, string> = {
+        reports: 'Суточные отчёты будут приходить в этот топик.',
+        receipts: 'Суточные отчёты НЕ будут приходить в этот топик.',
+        issues: 'Актуальные вопросы будут публиковаться в этот топик.',
+        general: 'Общий топик — отчёты будут приходить сюда.',
+      };
+      const typeDesc = typeDescs[topicType] || '';
 
       await ctx.editMessageText(
         `✅ Топик привязан к объекту "<b>${project.name}</b>" (${typeLabel}).\n\n` +
@@ -192,12 +190,7 @@ export function setupTopicLink(bot: Bot<BotContext>): void {
       return;
     }
 
-    const threadId = ctx.message?.message_thread_id;
-    if (!threadId) {
-      await ctx.reply('Эту команду нужно отправлять из привязанного топика.');
-      return;
-    }
-
+    const threadId = ctx.message?.message_thread_id ?? 0;
     const chatId = ctx.chat.id;
 
     try {
@@ -285,5 +278,7 @@ async function sendTypeSelection(ctx: BotContext, projectId: number, projectName
 function buildTypeKeyboard(projectId: number): InlineKeyboard {
   return new InlineKeyboard()
     .text('📋 Отчёты', `link:t:${projectId}:reports`)
-    .text('🧾 Чеки', `link:t:${projectId}:receipts`);
+    .text('🧾 Чеки', `link:t:${projectId}:receipts`)
+    .row()
+    .text('❓ Вопросы', `link:t:${projectId}:issues`);
 }

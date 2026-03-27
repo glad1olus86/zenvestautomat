@@ -17,12 +17,14 @@ export async function resolveGroup(ctx: BotContext, next: NextFunction): Promise
     ctx.callbackQuery?.message?.message_thread_id ??
     null;
 
-  if (chatId && isGroup && threadId) {
+  if (chatId && isGroup) {
+    // General topic has no thread_id — use 0 as marker in DB
+    const dbThreadId = threadId ?? 0;
     try {
       const project = await db('project_topics')
         .join('projects', 'project_topics.project_id', 'projects.id')
         .where('project_topics.telegram_group_id', chatId.toString())
-        .where('project_topics.topic_thread_id', threadId)
+        .where('project_topics.topic_thread_id', dbThreadId)
         .select('projects.*')
         .first();
 

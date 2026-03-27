@@ -107,11 +107,15 @@ export function startReceiptWorker(bot: Bot<BotContext>): Worker {
         ? `\n💱 ${receiptData.amount} ${receiptData.currency} → ${amountCzk} CZK (курс: ${exchangeRate})`
         : '';
 
+      const vatNote = receiptData.amount_with_vat
+        ? `\n🧾 С НДС: ${receiptData.amount_with_vat} ${receiptData.currency} (НДС ${receiptData.vat_rate || 21}%)`
+        : '';
+
       await bot.api.sendMessage(
         telegramGroupId,
         `✅ Чек распознан:\n` +
         `📝 ${receiptData.description}\n` +
-        `💰 ${receiptData.amount} ${receiptData.currency}${currencyNote}\n` +
+        `💰 ${receiptData.amount} ${receiptData.currency} (bez DPH)${vatNote}${currencyNote}\n` +
         `🏪 ${receiptData.shop || '—'}\n` +
         `📂 ${receiptData.category}\n` +
         `📅 ${receiptData.date}`,

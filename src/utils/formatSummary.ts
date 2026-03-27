@@ -2,6 +2,9 @@ export interface WorkerHoursEntry {
   workerName: string;
   workerType: string;
   hours: number;
+  hourlyRate?: number;
+  cost?: number;          // hours × hourlyRate
+  source?: 'gps' | 'manual';
 }
 
 /**
@@ -15,50 +18,49 @@ export function formatDailySummary(params: {
   budgetCzk: number;
   remainingCzk: number;
   laborBudgetCzk: number;
-  allocatedHours: number;
-  spentHours: number;
-  remainingHours: number;
+  spentLaborCzk: number;
+  remainingLaborCzk: number;
   workerHoursToday?: WorkerHoursEntry[];
 }): string {
   const lines = [
     `📊 <b>ЕЖЕДНЕВНАЯ СВОДКА — ${params.projectName} — ${params.date}</b>`,
   ];
 
-  // Блок человеко-часов (ручной ввод через /hours)
+  // Блок человеко-часов (GPS + ручной ввод) с расчётом стоимости
   if (params.workerHoursToday && params.workerHoursToday.length > 0) {
     lines.push('', '<b>Рабочие часы (сегодня):</b>');
 
     let totalHours = 0;
+    let totalCost = 0;
     for (const entry of params.workerHoursToday) {
-      const icon = entry.workerType === 'helper' ? '🔧' : '👷';
-      lines.push(`— ${icon} ${entry.workerName}: ${entry.hours} ч`);
+      const typeIcon = entry.workerType === 'helper' ? '🔧' : '👷';
+      const sourceIcon = entry.source === 'gps' ? ' 📡' : entry.source === 'manual' ? ' ✏️' : '';
+      const costStr = entry.cost ? ` → ${fmt(entry.cost)} CZK` : '';
+      lines.push(`— ${typeIcon} ${entry.workerName}: ${entry.hours} ч${sourceIcon}${costStr}`);
       totalHours += entry.hours;
+      totalCost += entry.cost || 0;
     }
-    lines.push(`— <b>Итого: ${totalHours} ч</b>`);
+    lines.push(`— <b>Итого: ${totalHours} ч → ${fmt(totalCost)} CZK</b>`);
   }
 
-  // Блок финансов
+  // Блок финансов — материалы
   lines.push(
     '',
-    '<b>Финансы:</b>',
+    '<b>Материалы:</b>',
     `— Потрачено сегодня: ${fmt(params.spentTodayCzk)} CZK`,
     `— Итого по объекту: ${fmt(params.spentTotalCzk)} CZK`,
-    `— Бюджет материалы: ${fmt(params.budgetCzk)} CZK`,
-    `— Остаток материалы: ${fmt(params.remainingCzk)} CZK`,
+    `— Бюджет: ${fmt(params.budgetCzk)} CZK`,
+    `— Остаток: ${fmt(params.remainingCzk)} CZK`,
   );
 
-  if (params.laborBudgetCzk > 0) {
-    lines.push(`— Заложено работы: ${fmt(params.laborBudgetCzk)} CZK`);
-  }
-
-  // Блок заложенных часов — только если есть данные (GPS отложен)
-  if (params.allocatedHours > 0) {
+  // Блок финансов — работы
+  if (params.laborBudgetCzk > 0 || params.spentLaborCzk > 0) {
     lines.push(
       '',
-      '<b>Часы (план):</b>',
-      `— Заложено: ${params.allocatedHours} ч`,
-      `— Израсходовано: ${params.spentHours} ч`,
-      `— Остаток: ${params.remainingHours} ч`,
+      '<b>Работы:</b>',
+      `— Заложено: ${fmt(params.laborBudgetCzk)} CZK`,
+      `— Израсходовано: ${fmt(params.spentLaborCzk)} CZK`,
+      `— Остаток: ${fmt(params.remainingLaborCzk)} CZK`,
     );
   }
 

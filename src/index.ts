@@ -63,8 +63,8 @@ async function main() {
   const reportWorker = startReportWorker(bot);
   await startBot(bot);
 
-  // 7. Планировщики (суточные отчёты 20:00 + Sheets sync каждые 5 мин)
-  startScheduler();
+  // 7. Планировщики (напоминание 18:00, суточные отчёты 20:00, Sheets sync каждые 5 мин)
+  startScheduler(bot);
 
   // Graceful shutdown
   const shutdown = async (signal: string) => {
