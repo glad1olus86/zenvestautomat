@@ -20,6 +20,11 @@ export function setupDocumentMessage(bot: Bot<BotContext>): void {
       return;
     }
 
+    // Чеки сканируются только в топике «Чеки»
+    if (ctx.topicType !== 'receipts') {
+      return;
+    }
+
     const doc = ctx.message.document;
 
     // Только PDF

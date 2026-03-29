@@ -32,6 +32,7 @@ export interface ProjectData {
 
 export interface BotContext extends Context {
   project?: ProjectData | null;
+  topicType?: string | null;
 }
 
 export function createBot(): Bot<BotContext> {

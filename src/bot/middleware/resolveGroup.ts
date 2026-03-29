@@ -21,14 +21,15 @@ export async function resolveGroup(ctx: BotContext, next: NextFunction): Promise
     // General topic has no thread_id — use 0 as marker in DB
     const dbThreadId = threadId ?? 0;
     try {
-      const project = await db('project_topics')
+      const binding = await db('project_topics')
         .join('projects', 'project_topics.project_id', 'projects.id')
         .where('project_topics.telegram_group_id', chatId.toString())
         .where('project_topics.topic_thread_id', dbThreadId)
-        .select('projects.*')
+        .select('projects.*', 'project_topics.topic_type')
         .first();
 
-      ctx.project = project || null;
+      ctx.project = binding || null;
+      ctx.topicType = binding?.topic_type || null;
     } catch (err) {
       logger.error({ err, chatId, threadId }, 'Failed to resolve project by topic');
       ctx.project = null;

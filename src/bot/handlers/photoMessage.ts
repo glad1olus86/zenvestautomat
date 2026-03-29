@@ -6,7 +6,7 @@ import { downloadTelegramFile } from '../../utils/downloadFile';
 import { logger } from '../../utils/logger';
 
 /**
- * Обрабатывает фото в группах — все фото считаются чеками.
+ * Обрабатывает фото ТОЛЬКО в топике «Чеки» (topic_type = 'receipts').
  * Скачивает, создаёт запись receipt(pending), ставит в очередь распознавания.
  */
 export function setupPhotoMessage(bot: Bot<BotContext>): void {
@@ -17,6 +17,11 @@ export function setupPhotoMessage(bot: Bot<BotContext>): void {
 
     // Только привязанные топики
     if (!ctx.project) {
+      return;
+    }
+
+    // Чеки сканируются только в топике «Чеки»
+    if (ctx.topicType !== 'receipts') {
       return;
     }
 
